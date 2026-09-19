@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Markdown 渲染器（手写解析器版）</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 顶部工具栏 -->
+  <header class="toolbar">
+    <h1>Markdown 渲染器</h1>
+    <div class="actions">
+      <select id="example-select" title="加载示例">
+        <option value="" disabled>加载示例…</option>
+      </select>
+      <button id="btn-copy" type="button">复制 HTML</button>
+      <button id="btn-clear" type="button">清空</button>
+      <button id="btn-test" type="button">运行测试</button>
+      <span id="parse-time" class="parse-time" title="解析耗时">0 ms</span>
+    </div>
+  </header>
+
+  <!-- 左右分栏：编辑区 / 预览区 -->
+  <main class="workspace">
+    <section class="pane editor-pane">
+      <div class="pane-title">Markdown 源文本</div>
+      <textarea id="editor" spellcheck="false" placeholder="在此输入 Markdown..."></textarea>
+    </section>
+    <section class="pane preview-pane">
+      <div class="pane-title">实时预览</div>
+      <div id="preview" class="preview"></div>
+    </section>
+  </main>
+
+  <!-- 测试结果面板 -->
+  <section id="test-panel" class="test-panel hidden">
+    <div id="test-summary" class="test-summary"></div>
+    <ul id="test-results" class="test-results"></ul>
+  </section>
+
+  <!-- 轻提示 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- 加载拼接后的经典脚本：保证 file:// 双击直开无 CORS 报错。
+         模块化源码见 src/（ES Modules），改动后运行 node build-bundle.mjs 重新生成 -->
+    <script src="app.bundle.js" defer></script>
+</body>
+</html>
