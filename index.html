@@ -1,0 +1,1571 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>网页版 Markdown 渲染器（手写解析器版）</title>
+  <!--
+    说明：
+    - 解析器为完全手写，无任何第三方依赖、无网络请求。
+    - src/ 目录是标准 ES Modules 源码（开发/审阅用）。
+    - 为保证“双击 index.html 即可运行”且 file:// 下零控制台报错
+      （Chrome 的 CORS 策略会阻止 file:// 页面加载外部 module 脚本），
+      本文件把同一份模块源码内联到一个 module 脚本标签中，
+      内容与 src/ 下文件一一对应，并以 ===== src/xxx.js ===== 分隔。
+  -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <h1>Markdown 渲染器 · 手写解析器</h1>
+    <select id="sampleSelect" title="选择示例"></select>
+    <button id="loadSampleBtn" type="button">加载示例</button>
+    <button id="copyHtmlBtn" type="button">复制 HTML</button>
+    <button id="clearBtn" type="button">清空</button>
+    <button id="runTestsBtn" type="button">运行测试</button>
+    <span class="spacer"></span>
+    <span id="timing">解析耗时：-</span>
+  </header>
+
+  <main class="workspace">
+    <section class="pane">
+      <div class="pane-header">Markdown 源文本</div>
+      <textarea id="editor" spellcheck="false" placeholder="在此输入 Markdown..."></textarea>
+    </section>
+    <section class="pane">
+      <div class="pane-header">实时预览</div>
+      <div id="preview"></div>
+    </section>
+  </main>
+
+  <section id="testPanel" hidden>
+    <div id="testSummary" class="test-summary"></div>
+    <div id="testList"></div>
+  </section>
+
+  <script type="module">
+// ===== src/inline-parser.js =====
+// src/inline-parser.js
+// 行内解析器：把段落级纯文本解析为行内 AST。
+// 核心优先级：转义字符 -> 行内代码 -> 图片 -> 链接 -> 强调（粗体/斜体/删除线）。
+// 本模块只负责结构，所有文本的 HTML 转义统一交给 renderer，避免双重转义。
+
+// 块级阶段用该私有符号标记“行尾两空格”产生的强制换行
+const HARD_BREAK = '\u0000';
+
+// 允许反斜杠转义的字符（覆盖题目要求并兼容 CommonMark 常见集合）
+const ESCAPABLE = new Set(['\\', '`', '*', '_', '{', '}', '[', ']',
+  '(', ')', '#', '+', '-', '.', '!', '|', '>', '~', '"', "'", '/']);
+
+function isWhitespace(ch) {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === HARD_BREAK;
+}
+
+function isAlphanumeric(ch) {
+  if (!ch) return false;
+  const code = ch.codePointAt(0);
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+// Unicode 风格的“标点”判定：非空白且非字母数字即视为标点
+function isPunctuation(ch) {
+  return !!ch && !isWhitespace(ch) && !isAlphanumeric(ch);
+}
+
+/**
+ * 解析行内代码。start 指向起始反引号。
+ * 闭合规则：寻找长度“恰好相等”的反引号串（CommonMark 行为的简化版）。
+ * 返回 { node, next }，找不到合法闭合时返回 null（反引号按普通文本处理）。
+ */
+function parseCodeSpan(src, start) {
+  let tickCount = 0;
+  while (start + tickCount < src.length && src[start + tickCount] === '`') tickCount++;
+
+  let search = start + tickCount;
+  let closeStart = -1;
+  while (search < src.length) {
+    const idx = src.indexOf('`', search);
+    if (idx === -1) break;
+    let runLength = 0;
+    while (idx + runLength < src.length && src[idx + runLength] === '`') runLength++;
+    if (runLength === tickCount) {
+      closeStart = idx;
+      break;
+    }
+    search = idx + runLength;
+  }
+  if (closeStart === -1) return null;
+
+  let content = src.slice(start + tickCount, closeStart);
+  // 内容首尾各恰有一个空格、且整体不全是空白时，剔除这两个空格
+  if (content.length >= 2 && content[0] === ' ' &&
+      content[content.length - 1] === ' ' && content.trim() !== '') {
+    content = content.slice(1, -1);
+  }
+  // 代码 span 内的换行规范化为空格
+  content = content.replace(/\r?\n/g, ' ');
+
+  return { node: { type: 'code', value: content }, next: closeStart + tickCount };
+}
+
+/**
+ * 从 openIdx（指向 '['）开始寻找匹配的 ']'，支持嵌套与反斜杠转义，
+ * 跨越行内代码时不把代码内部的括号计入。
+ */
+function findMatchingBracket(src, openIdx) {
+  let depth = 1;
+  let i = openIdx + 1;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === '\\') {
+      i += 2;
+      continue;
+    }
+    if (ch === '`') {
+      const codeSpan = parseCodeSpan(src, i);
+      if (codeSpan) {
+        i = codeSpan.next;
+        continue;
+      }
+    }
+    if (ch === '[') depth++;
+    if (ch === ']') {
+      depth--;
+      if (depth === 0) return i;
+    }
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * 解析链接目标部分： ( url "title" )
+ * start 指向 '('。返回 { url, title, next } 或 null。
+ */
+function parseLinkDestination(src, start) {
+  let i = start + 1;
+  while (i < src.length && isWhitespace(src[i]) && src[i] !== HARD_BREAK) i++;
+
+  let url = '';
+  if (src[i] === '<') {
+    const end = src.indexOf('>', i + 1);
+    if (end === -1) return null;
+    // 尖括号内的反斜杠转义解开
+    url = src.slice(i + 1, end).replace(/\\(.)/g, '$1');
+    i = end + 1;
+  } else {
+    const begin = i;
+    let parenDepth = 0;
+    while (i < src.length) {
+      const ch = src[i];
+      if (ch === '\\') { i += 2; continue; }
+      if (isWhitespace(ch)) break;
+      if (ch === '(') parenDepth++;
+      if (ch === ')') {
+        if (parenDepth === 0) break;
+        parenDepth--;
+      }
+      i++;
+    }
+    url = src.slice(begin, i);
+  }
+
+  // 可选的 title：必须与 url 之间至少有空白
+  let title = null;
+  const beforeSpace = i;
+  while (i < src.length && src[i] === ' ') i++;
+  const quote = src[i];
+  if (i > beforeSpace && (quote === '"' || quote === "'")) {
+    let j = i + 1;
+    let value = '';
+    let closed = false;
+    while (j < src.length) {
+      if (src[j] === quote) { closed = true; break; }
+      if (src[j] === '\\') { value += src[j + 1] ?? ''; j += 2; continue; }
+      value += src[j];
+      j++;
+    }
+    if (closed) {
+      title = value;
+      i = j + 1;
+      while (i < src.length && (src[i] === ' ' || src[i] === '\t')) i++;
+    }
+  }
+
+  if (src[i] !== ')') return null;
+  return { url: url.trim(), title, next: i + 1 };
+}
+
+/**
+ * 行内解析主入口。
+ * 使用分隔符栈处理强调：开界符先以 delim 节点占位入栈，
+ * 命中闭界符时再把两个界符之间的节点包裹成 em/strong/strike。
+ * 未匹配的界符在收尾阶段还原为普通文本。
+ */
+function parseInline(source) {
+  const src = String(source ?? '');
+  const nodes = [];
+  let textBuffer = '';
+  const openers = []; // { char, count, nodeIndex }
+
+  const flushText = () => {
+    if (textBuffer !== '') {
+      nodes.push({ type: 'text', value: textBuffer });
+      textBuffer = '';
+    }
+  };
+
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+
+    // 强制换行标记（块级阶段注入）
+    if (ch === HARD_BREAK) {
+      flushText();
+      nodes.push({ type: 'hardbreak' });
+      i++;
+      continue;
+    }
+    if (ch === '\n') {
+      flushText();
+      nodes.push({ type: 'softbreak' });
+      i++;
+      continue;
+    }
+
+    // 反斜杠转义
+    if (ch === '\\') {
+      const next = src[i + 1];
+      if (next && ESCAPABLE.has(next)) {
+        textBuffer += next;
+        i += 2;
+        continue;
+      }
+      if (next === '\n' || next === HARD_BREAK) {
+        flushText();
+        nodes.push({ type: 'hardbreak' });
+        i += 2;
+        continue;
+      }
+      textBuffer += ch;
+      i++;
+      continue;
+    }
+
+    // 行内代码：优先级最高，内部不做任何解析
+    if (ch === '`') {
+      const codeSpan = parseCodeSpan(src, i);
+      if (codeSpan) {
+        flushText();
+        nodes.push(codeSpan.node);
+        i = codeSpan.next;
+        continue;
+      }
+      textBuffer += ch;
+      i++;
+      continue;
+    }
+
+    // 图片 ![alt](url)
+    if (ch === '!' && src[i + 1] === '[') {
+      const close = findMatchingBracket(src, i + 1);
+      if (close !== -1 && src[close + 1] === '(') {
+        const dest = parseLinkDestination(src, close + 1);
+        if (dest) {
+          flushText();
+          nodes.push({
+            type: 'image',
+            url: dest.url,
+            title: dest.title,
+            alt: src.slice(i + 2, close).replace(/\\(.)/g, '$1')
+          });
+          i = dest.next;
+          continue;
+        }
+      }
+    }
+
+    // 链接 [text](url)
+    if (ch === '[') {
+      const close = findMatchingBracket(src, i);
+      if (close !== -1 && src[close + 1] === '(') {
+        const dest = parseLinkDestination(src, close + 1);
+        if (dest) {
+          flushText();
+          const label = src.slice(i + 1, close);
+          nodes.push({
+            type: 'link',
+            url: dest.url,
+            title: dest.title,
+            children: parseInline(label)
+          });
+          i = dest.next;
+          continue;
+        }
+      }
+    }
+
+    // 强调分隔符：*  _  ~
+    if (ch === '*' || ch === '_' || ch === '~') {
+      let count = 0;
+      while (i + count < src.length && src[i + count] === ch) count++;
+
+      // 删除线只接受恰好两个 ~
+      if (ch === '~' && count !== 2) {
+        textBuffer += '~'.repeat(count);
+        i += count;
+        continue;
+      }
+
+      const before = src[i - 1];
+      const after = src[i + count];
+
+      // CommonMark 左右侧翼判定；边界（before/after 为空）不参与标点条件
+      const afterPunc = isPunctuation(after);
+      const beforePunc = isPunctuation(before);
+      const leftFlanking = !!after && !isWhitespace(after) &&
+        (!afterPunc || !before || isWhitespace(before) || beforePunc);
+      const rightFlanking = !!before && !isWhitespace(before) &&
+        (!beforePunc || !after || isWhitespace(after) || afterPunc);
+
+      let canOpen = leftFlanking;
+      let canClose = rightFlanking;
+      if (ch === '_') {
+        // 下划线有更严格的单词内限制
+        canOpen = leftFlanking && (!rightFlanking || beforePunc);
+        canClose = rightFlanking && (!leftFlanking || afterPunc);
+      }
+
+      if (canClose) {
+        // 在栈中自顶向下寻找同字符的开界符
+        let openerIndex = -1;
+        for (let k = openers.length - 1; k >= 0; k--) {
+          if (openers[k].char === ch) { openerIndex = k; break; }
+        }
+        if (openerIndex !== -1) {
+          const opener = openers[openerIndex];
+          flushText();
+          const inner = nodes.splice(opener.nodeIndex + 1);
+          nodes.pop(); // 移除开界符占位节点
+          const useCount = Math.min(opener.count, count);
+          const type = ch === '~' ? 'strike'
+            : useCount >= 3 ? 'strongEm'
+            : useCount === 2 ? 'strong' : 'em';
+          nodes.push({ type, children: inner });
+          openers.length = openerIndex; // 上方的栈条目已被包入子节点
+          i += useCount;
+          count -= useCount;
+          canClose = false;
+          // 剩余的界符若能开界，则作为新的开界符继续
+          if (count > 0 && leftFlanking) {
+            flushText();
+            const pos = nodes.length;
+            nodes.push({ type: 'delim', value: ch.repeat(count) });
+            openers.push({ char: ch, count, nodeIndex: pos });
+            i += count;
+            continue;
+          }
+          if (count > 0) {
+            textBuffer += ch.repeat(count);
+            i += count;
+            continue;
+          }
+          continue;
+        }
+      }
+
+      if (canOpen) {
+        flushText();
+        const pos = nodes.length;
+        nodes.push({ type: 'delim', value: ch.repeat(count) });
+        openers.push({ char: ch, count, nodeIndex: pos });
+        i += count;
+        continue;
+      }
+
+      // 既不能开也不能闭：原样输出
+      textBuffer += ch.repeat(count);
+      i += count;
+      continue;
+    }
+
+    textBuffer += ch;
+    i++;
+  }
+
+  flushText();
+  finalizeDelimiters(nodes);
+  return nodes;
+}
+
+// 把所有未闭合的界符节点还原为普通文本（链接子树由各自的 parseInline 收尾）
+function finalizeDelimiters(nodes) {
+  for (let k = 0; k < nodes.length; k++) {
+    const node = nodes[k];
+    if (node.type === 'delim') {
+      nodes[k] = { type: 'text', value: node.value };
+    }
+    if (node.children) finalizeDelimiters(node.children);
+  }
+}
+
+
+
+
+// ===== src/block-parser.js =====
+// src/block-parser.js
+// 块级解析器：递归下降，把 Markdown 文本切成块级 AST。
+// 支持：标题、段落（强制换行）、围栏代码块、引用（嵌套）、
+// 无序/有序列表（2 或 4 空格缩进嵌套，多段落列表项）、
+// 表格（含对齐）、水平线。任何无法识别的内容退化为普通段落。
+
+
+const HEADING_RE = /^(#{1,6})(?:[ \t]+(.*?))?[ \t]*#*[ \t]*$/;
+const FENCE_RE = /^(\s*)(`{3,}|~{3,})([^\n]*)$/;
+const HR_RE = /^[ \t]{0,3}([-*_])(?:[ \t]*\1[ \t]*){2,}$/;
+const UL_RE = /^(\s*)([-*+])([ \t]+)(.*)$/;
+const OL_RE = /^(\s*)(\d{1,9})([.)])([ \t]+)(.*)$/;
+const QUOTE_RE = /^(\s*)>( ?)(.*)$/;
+const TABLE_SEP_RE = /^\s*:?-{1,}:?\s*$/;
+
+// 预处理：\r\n 归一、tab 展开（4 空格 tab stop）
+function preprocess(text) {
+  const normalized = String(text ?? '').replace(/\r\n?/g, '\n');
+  return normalized.split('\n').map((line) => {
+    let result = '';
+    for (const ch of line) {
+      if (ch === '\t') result += ' '.repeat(4 - (result.length % 4));
+      else result += ch;
+    }
+    return result;
+  });
+}
+
+function isBlank(line) {
+  return line.trim() === '';
+}
+
+// 一行是否“看起来像块级结构的开头”（用于懒续行的边界判定）
+function looksLikeBlockStart(line) {
+  if (isBlank(line)) return false;
+  if (HEADING_RE.test(line)) return true;
+  if (FENCE_RE.test(line)) return true;
+  if (HR_RE.test(line)) return true;
+  if (UL_RE.test(line)) return true;
+  if (OL_RE.test(line)) return true;
+  if (/^\s*>/.test(line)) return true;
+  return false;
+}
+
+function dedent(line, spaces) {
+  let removed = 0;
+  let i = 0;
+  while (removed < spaces && i < line.length && line[i] === ' ') {
+    removed++;
+    i++;
+  }
+  return line.slice(i);
+}
+
+/**
+ * 块级解析入口。
+ * @param {string} markdown 原始 Markdown 文本
+ * @returns {{type:'document', children:Array}}
+ */
+function parseBlocks(markdown) {
+  const lines = preprocess(markdown);
+  const children = parseLines(lines, 0, lines.length, 0);
+  return { type: 'document', children };
+}
+
+/**
+ * 解析 lines[start..end) 中 indent 列以上的内容。
+ */
+function parseLines(lines, start, end, indent) {
+  const blocks = [];
+  let i = start;
+
+  while (i < end) {
+    const line = lines[i];
+    const view = dedent(line, indent);
+
+    if (isBlank(view)) { i++; continue; }
+
+    const fenceMatch = view.match(FENCE_RE);
+    if (fenceMatch) {
+      const result = consumeFencedCode(lines, i, end, indent);
+      blocks.push(result.block);
+      i = result.next;
+      continue;
+    }
+
+    const headingMatch = view.match(HEADING_RE);
+    if (headingMatch) {
+      blocks.push({ type: 'heading', level: headingMatch[1].length, text: (headingMatch[2] || '').trim() });
+      i++;
+      continue;
+    }
+
+    if (HR_RE.test(view)) {
+      blocks.push({ type: 'hr' });
+      i++;
+      continue;
+    }
+
+    const quoteMatch = view.match(QUOTE_RE);
+    if (quoteMatch) {
+      const result = consumeBlockquote(lines, i, end, indent);
+      blocks.push(result.block);
+      i = result.next;
+      continue;
+    }
+
+    if (UL_RE.test(view) || OL_RE.test(view)) {
+      const result = consumeList(lines, i, end, indent);
+      blocks.push(result.block);
+      i = result.next;
+      continue;
+    }
+
+    if (view.indexOf('|') !== -1) {
+      const result = consumeTable(lines, i, end, indent);
+      if (result) {
+        blocks.push(result.block);
+        i = result.next;
+        continue;
+      }
+    }
+
+    const result = consumeParagraph(lines, i, end, indent);
+    blocks.push(result.block);
+    i = result.next;
+  }
+
+  return blocks;
+}
+
+// ---------- 围栏代码块 ----------
+function consumeFencedCode(lines, start, end, indent) {
+  const openMatch = dedent(lines[start], indent).match(FENCE_RE);
+  const marker = openMatch[2][0];
+  const markerLength = openMatch[2].length;
+  const lang = openMatch[3].trim();
+  const fenceIndent = indent + openMatch[1].length;
+
+  const raw = [];
+  let i = start + 1;
+  while (i < end) {
+    const view = dedent(lines[i], fenceIndent);
+    const close = view.match(/^(\s*)(`{3,}|~{3,})\s*$/);
+    if (close && close[2][0] === marker && close[2].length >= markerLength && close[1].length === 0) {
+      i++;
+      return { block: { type: 'codeBlock', lang, value: raw.join('\n'), closed: true }, next: i };
+    }
+    raw.push(view);
+    i++;
+  }
+  // 未闭合的围栏也按代码块处理，内容原样输出，保证不崩溃
+  return { block: { type: 'codeBlock', lang, value: raw.join('\n'), closed: false }, next: i };
+}
+
+// ---------- 引用块（支持嵌套，内容可为列表等任意块） ----------
+function consumeBlockquote(lines, start, end, indent) {
+  const innerLines = [];
+  let i = start;
+  let hadBlank = false;
+
+  while (i < end) {
+    const view = dedent(lines[i], indent);
+    if (isBlank(view)) {
+      hadBlank = true;
+      i++;
+      continue;
+    }
+    const q = view.match(QUOTE_RE);
+    if (q) {
+      hadBlank = false;
+      innerLines.push(' '.repeat(q[1].length) + q[3]); // 去掉 "> "，最多吃一个空格
+      i++;
+      continue;
+    }
+    // 懒续行：空行之后的普通行不再属于引用
+    if (hadBlank) break;
+    innerLines.push(view);
+    i++;
+  }
+
+  while (innerLines.length && isBlank(innerLines[innerLines.length - 1])) innerLines.pop();
+  const children = parseLines(innerLines, 0, innerLines.length, 0);
+  return { block: { type: 'blockquote', children }, next: i };
+}
+
+// ---------- 列表 ----------
+function parseListItemMarker(line) {
+  const ul = line.match(UL_RE);
+  if (ul) {
+    return {
+      ordered: false,
+      markerIndent: ul[1].length,
+      contentColumn: ul[1].length + ul[2].length + ul[3].length,
+      text: ul[4],
+      delimiter: ul[2]
+    };
+  }
+  const ol = line.match(OL_RE);
+  if (ol) {
+    return {
+      ordered: true,
+      markerIndent: ol[1].length,
+      contentColumn: ol[1].length + ol[2].length + 1 + ol[4].length,
+      text: ol[5],
+      order: parseInt(ol[2], 10),
+      delimiter: ol[3]
+    };
+  }
+  return null;
+}
+
+function markerInfo(view) {
+  const m = parseListItemMarker(view);
+  if (!m) return null;
+  // 标记后空白的结束位置（允许 tab，预处理已把 tab 展开为空格）
+  const afterMarker = m.markerIndent + (m.ordered ? m.delimiter.length + 1 : 1);
+  let spaces = 0;
+  while (afterMarker + spaces < view.length && view[afterMarker + spaces] === ' ') spaces++;
+  let contentColumn = afterMarker + spaces;
+  if (spaces > 4) contentColumn = afterMarker + 1; // CommonMark：超过 4 空格按 1 空格缩进来对齐
+  return {
+    ordered: m.ordered,
+    markerIndent: m.markerIndent,
+    delimiter: m.delimiter,
+    order: m.order,
+    contentColumn,
+    text: view.slice(afterMarker + Math.min(spaces, contentColumn - afterMarker))
+  };
+}
+
+function consumeList(lines, start, end, indent) {
+  const first = markerInfo(dedent(lines[start], indent));
+  const ordered = first.ordered;
+  const delimiter = first.delimiter;
+
+  const items = [];
+  let i = start;
+  let looseFlag = false;
+
+  while (i < end) {
+    const view = dedent(lines[i], indent);
+    if (isBlank(view)) {
+      let j = i + 1;
+      while (j < end && isBlank(dedent(lines[j], indent))) j++;
+      if (j >= end) break;
+      const afterView = dedent(lines[j], indent);
+      const afterMarker = markerInfo(afterView);
+      const sameMarker = afterMarker && afterMarker.markerIndent === first.markerIndent &&
+        afterMarker.ordered === ordered && afterMarker.delimiter === delimiter;
+      if (!sameMarker && afterView[0] !== ' ') break;
+      i = j;
+      continue;
+    }
+
+    const marker = markerInfo(view);
+    if (!marker || marker.markerIndent !== first.markerIndent) break;
+
+    const itemLines = [marker.text];
+    const itemIndent = marker.contentColumn;
+    i++;
+    let looseThisItem = false;
+
+    while (i < end) {
+      const current = dedent(lines[i], indent);
+      if (isBlank(current)) {
+        let j = i + 1;
+        while (j < end && isBlank(dedent(lines[j], indent))) j++;
+        if (j >= end) { i = end; break; }
+        const nextView = dedent(lines[j], indent);
+        const nextMarker = markerInfo(nextView);
+        const nextSame = nextMarker && nextMarker.markerIndent === first.markerIndent &&
+          nextMarker.ordered === ordered && nextMarker.delimiter === delimiter;
+        if (nextSame) { looseThisItem = true; break; } // 空行分隔的下一个列表项
+        if (nextView[0] !== ' ') { i = j; break; }
+        itemLines.push('');
+        i = j;
+        continue;
+      }
+
+      const currentMarker = markerInfo(current);
+      if (currentMarker && currentMarker.markerIndent === first.markerIndent) break;
+
+      if (current[0] === ' ') {
+        // 缩进行统一剥掉 itemIndent 列：普通续行因此到第 0 列，
+        // 嵌套列表标记则保留 (markerIndent - itemIndent) 的相对缩进
+        itemLines.push(dedent(current, itemIndent));
+      } else if (looksLikeBlockStart(current)) {
+        break;
+      } else {
+        itemLines.push(current); // 懒续行
+      }
+      i++;
+    }
+
+    while (itemLines.length && isBlank(itemLines[itemLines.length - 1])) itemLines.pop();
+    const children = parseLines(itemLines, 0, itemLines.length, 0);
+    const innerLoose = itemHasBlankBetweenContent({ children });
+    items.push({ type: 'listItem', children });
+    if (looseThisItem || innerLoose) looseFlag = true;
+  }
+
+  // 松散判定：任一列表项内部存在“内容之间的空行”，或项之间被空行分隔
+  const loose = looseFlag;
+  return {
+    block: { type: 'list', ordered, start: ordered ? first.order : null, loose, items },
+    next: i
+  };
+}
+
+function itemHasBlankBetweenContent(item) {
+  const walk = (blocks) => {
+    for (const block of blocks) {
+      if (block.type === 'list') {
+        if (block.items.some((child) => itemHasBlankBetweenContent(child))) return true;
+      }
+    }
+    return false;
+  };
+  // 同一列表项里出现两个及以上“非列表”块，通常意味着空行分隔（多段落/段落+代码块等）
+  const major = item.children.filter((block) => block.type !== 'list');
+  if (major.length >= 2) return true;
+  return walk(item.children);
+}
+// ---------- 表格 ----------
+function splitTableRow(line) {
+  let trimmed = line.trim();
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith('|') && !trimmed.endsWith('\\|')) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  const cells = [];
+  let current = '';
+  for (let k = 0; k < trimmed.length; k++) {
+    const ch = trimmed[k];
+    if (ch === '\\' && trimmed[k + 1] === '|') {
+      current += '|';
+      k++;
+      continue;
+    }
+    if (ch === '|') {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function consumeTable(lines, start, end, indent) {
+  const header = dedent(lines[start], indent);
+  const separator = start + 1 < end ? dedent(lines[start + 1], indent) : null;
+  if (!separator || separator.indexOf('|') === -1) return null;
+
+  const headerCells = splitTableRow(header);
+  const sepCells = splitTableRow(separator);
+  if (headerCells.length < 2 || sepCells.length !== headerCells.length) return null;
+  if (!sepCells.every((cell) => TABLE_SEP_RE.test(cell))) return null;
+
+  const aligns = sepCells.map((cell) => {
+    const left = cell.startsWith(':');
+    const right = cell.endsWith(':') && cell.length > 1;
+    if (left && right) return 'center';
+    if (right) return 'right';
+    if (left) return 'left';
+    return null;
+  });
+
+  const rows = [];
+  let i = start + 2;
+  while (i < end) {
+    const view = dedent(lines[i], indent);
+    if (isBlank(view) || view.indexOf('|') === -1) break;
+    const cells = splitTableRow(view);
+    while (cells.length < headerCells.length) cells.push('');
+    rows.push(cells.slice(0, headerCells.length));
+    i++;
+  }
+
+  return {
+    block: { type: 'table', header: headerCells, aligns, rows },
+    next: i
+  };
+}
+
+// ---------- 段落 ----------
+function consumeParagraph(lines, start, end, indent) {
+  const collected = [];
+  let i = start;
+  while (i < end) {
+    const view = dedent(lines[i], indent);
+    if (isBlank(view)) break;
+    if (collected.length > 0) {
+      if (FENCE_RE.test(view) || HR_RE.test(view) || QUOTE_RE.test(view)) break;
+      if (UL_RE.test(view)) break;
+      const olStart = view.match(OL_RE);
+      if (olStart && parseInt(olStart[2], 10) === 1) break;
+    }
+    collected.push(view);
+    i++;
+  }
+
+  // “行尾两空格” -> 强制换行标记；其余换行保留为软换行
+  const text = collected
+    .map((line) => line.replace(/  $/u, HARD_BREAK).replace(/[ \t]+$/u, ''))
+    .join('\n');
+
+  return { block: { type: 'paragraph', text }, next: i };
+}
+
+
+
+
+
+
+
+
+// ===== src/renderer.js =====
+// src/renderer.js
+// AST -> HTML 渲染器。
+// 块节点的行内内容在此阶段才调用 parseInline，做到“先块级、后行内”。
+// 所有动态文本统一经 escapeHtml/escapeAttr 转义；
+// 链接 URL 过滤 javascript: / vbscript: 等危险协议。
+
+
+function escapeHtml(text) {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeAttr(text) {
+  return escapeHtml(text);
+}
+
+// 危险协议过滤：仅拦截明确的脚本类协议，http(s)/相对路径/mailto/锚点等放行
+function safeUrl(rawUrl) {
+  const url = String(rawUrl ?? '').trim().replace(/[\u0000-\u0020]+/g, '');
+  if (url === '') return '';
+  const protocolMatch = url.match(/^([a-z][a-z0-9+.\-]*):/i);
+  if (!protocolMatch) return url; // 相对路径、#anchor 等
+  const scheme = protocolMatch[1].toLowerCase();
+  if (scheme === 'javascript' || scheme === 'vbscript' || scheme === 'file') {
+    return '';
+  }
+  return url;
+}
+
+function renderInlineNodes(nodes) {
+  let html = '';
+  for (const node of nodes) {
+    switch (node.type) {
+      case 'text':
+        html += escapeHtml(node.value);
+        break;
+      case 'code':
+        html += '<code class="md-code-inline">' + escapeHtml(node.value) + '</code>';
+        break;
+      case 'em':
+        html += '<em>' + renderInlineNodes(node.children) + '</em>';
+        break;
+      case 'strong':
+        html += '<strong>' + renderInlineNodes(node.children) + '</strong>';
+        break;
+      case 'strongEm':
+        html += '<strong><em>' + renderInlineNodes(node.children) + '</em></strong>';
+        break;
+      case 'strike':
+        html += '<del>' + renderInlineNodes(node.children) + '</del>';
+        break;
+      case 'link': {
+        const href = safeUrl(node.url);
+        const title = node.title ? ' title="' + escapeAttr(node.title) + '"' : '';
+        if (href) {
+          html += '<a href="' + escapeAttr(href) + '"' + title + ' target="_blank" rel="noopener noreferrer">' +
+            renderInlineNodes(node.children) + '</a>';
+        } else {
+          // 危险协议：不输出可执行链接，仅保留文本并给出语义标记
+          html += '<span class="md-unsafe-link" title="已拦截不安全的链接协议">' +
+            renderInlineNodes(node.children) + '</span>';
+        }
+        break;
+      }
+      case 'image': {
+        const src = safeUrl(node.url);
+        const alt = escapeAttr(node.alt || '');
+        const title = node.title ? ' title="' + escapeAttr(node.title) + '"' : '';
+        if (src) {
+          html += '<img src="' + escapeAttr(src) + '" alt="' + alt + '"' + title + '>';
+        } else {
+          html += '<span class="md-unsafe-link" title="已拦截不安全的图片地址">[' + escapeHtml(node.alt || 'image') + ']</span>';
+        }
+        break;
+      }
+      case 'hardbreak':
+        html += '<br>\n';
+        break;
+      case 'softbreak':
+        html += '\n';
+        break;
+      default:
+        // 理论上不会出现；兜底保证不抛异常
+        html += escapeHtml(node.value ?? '');
+    }
+  }
+  return html;
+}
+
+function renderInlineText(text) {
+  return renderInlineNodes(parseInline(text));
+}
+
+function renderBlocks(blocks, tightList) {
+  let html = '';
+  for (const block of blocks) {
+    switch (block.type) {
+      case 'heading':
+        html += '<h' + block.level + '>' + renderInlineText(block.text) + '</h' + block.level + '>\n';
+        break;
+      case 'paragraph':
+        if (tightList) {
+          // 紧凑列表项内的段落不包 <p>，直接输出行内内容
+          html += renderInlineText(block.text) + '\n';
+        } else {
+          html += '<p>' + renderInlineText(block.text) + '</p>\n';
+        }
+        break;
+      case 'codeBlock': {
+        const label = block.lang
+          ? '<div class="md-code-lang">' + escapeHtml(block.lang) + '</div>\n'
+          : '';
+        html += '<figure class="md-code-block">\n' + label +
+          '<pre><code' + (block.lang ? ' data-lang="' + escapeAttr(block.lang) + '"' : '') + '>' +
+          escapeHtml(block.value) + '</code></pre>\n</figure>\n';
+        break;
+      }
+      case 'blockquote':
+        html += '<blockquote>\n' + renderBlocks(block.children, false) + '</blockquote>\n';
+        break;
+      case 'hr':
+        html += '<hr>\n';
+        break;
+      case 'list':
+        html += renderList(block);
+        break;
+      case 'listItem':
+        // listItem 只在 list 上下文中渲染，这里兜底
+        html += '<li>' + renderBlocks(block.children, false) + '</li>\n';
+        break;
+      case 'table':
+        html += renderTable(block);
+        break;
+      default:
+        html += '<!-- 未知块类型 -->\n';
+    }
+  }
+  return html;
+}
+
+function renderList(list) {
+  const tag = list.ordered ? 'ol' : 'ul';
+  const startAttr = list.ordered && list.start !== 1 ? ' start="' + list.start + '"' : '';
+  let html = '<' + tag + startAttr + '>\n';
+  for (const item of list.items) {
+    html += '<li>' + renderBlocks(item.children, !list.loose) + '</li>\n';
+  }
+  html += '</' + tag + '>\n';
+  return html;
+}
+
+function renderTable(table) {
+  let html = '<table>\n<thead>\n<tr>\n';
+  table.header.forEach((cell, index) => {
+    const align = table.aligns[index];
+    const attr = align ? ' style="text-align:' + align + '"' : '';
+    html += '<th' + attr + '>' + renderInlineText(cell) + '</th>\n';
+  });
+  html += '</tr>\n</thead>\n<tbody>\n';
+  for (const row of table.rows) {
+    html += '<tr>\n';
+    row.forEach((cell, index) => {
+      const align = table.aligns[index];
+      const attr = align ? ' style="text-align:' + align + '"' : '';
+      html += '<td' + attr + '>' + renderInlineText(cell) + '</td>\n';
+    });
+    html += '</tr>\n';
+  }
+  html += '</tbody>\n</table>\n';
+  return html;
+}
+
+/**
+ * 文档级渲染入口。
+ * @param {{type:'document',children:Array}} ast
+ * @returns {string} HTML 字符串
+ */
+function renderDocument(ast) {
+  try {
+    return '<div class="markdown-body">\n' + renderBlocks(ast.children || [], false) + '</div>\n';
+  } catch (error) {
+    // 兜底：任何意外都不允许导致页面崩溃
+    return '<div class="md-render-error">渲染过程中出现异常：' +
+      escapeHtml(error && error.message ? error.message : String(error)) + '</div>';
+  }
+}
+
+
+// ===== src/tests.js =====
+// src/tests.js
+// 内置自测：给定 Markdown -> 渲染 HTML，对关键结构做断言。
+// 不依赖任何测试框架；runTests 可在浏览器与 Node 中直接运行。
+
+
+function render(markdown) {
+  return renderDocument(parseBlocks(markdown));
+}
+
+// 统计字符串中某个子串出现次数
+function countOccurrences(haystack, needle) {
+  if (needle === '') return 0;
+  let count = 0;
+  let pos = 0;
+  while ((pos = haystack.indexOf(needle, pos)) !== -1) {
+    count++;
+    pos += needle.length;
+  }
+  return count;
+}
+
+// 用栈校验标签嵌套深度是否达到期望值
+function maxNestingDepth(html, tag) {
+  const open = new RegExp('<' + tag + '(\\s|>)', 'g');
+  const close = new RegExp('</' + tag + '>', 'g');
+  let depth = 0;
+  let max = 0;
+  let cursor = 0;
+  const tokens = [];
+  let match;
+  while ((match = open.exec(html))) tokens.push({ index: match.index, kind: 'open' });
+  while ((match = close.exec(html))) tokens.push({ index: match.index, kind: 'close' });
+  tokens.sort((a, b) => a.index - b.index);
+  for (const token of tokens) {
+    if (token.kind === 'open') { depth++; max = Math.max(max, depth); }
+    else depth--;
+    cursor++;
+  }
+  return max;
+}
+
+function runTests() {
+  const cases = [
+    {
+      name: '1. 六级标题全部渲染',
+      check: (html) =>
+        html.includes('<h1>H1</h1>') &&
+        html.includes('<h2>H2</h2>') &&
+        html.includes('<h3>H3</h3>') &&
+        html.includes('<h4>H4</h4>') &&
+        html.includes('<h5>H5</h5>') &&
+        html.includes('<h6>H6</h6>'),
+      input: '# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6'
+    },
+    {
+      name: '2. 空行分段',
+      check: (html) => countOccurrences(html, '<p>') === 2,
+      input: '第一段\n\n第二段'
+    },
+    {
+      name: '3. 行尾两空格为强制换行 <br>',
+      check: (html) => html.includes('第一行<br>') && html.includes('第二行'),
+      input: '第一行  \n第二行'
+    },
+    {
+      name: '4. 斜体 *text*',
+      check: (html) => html.includes('<em>斜体</em>'),
+      input: '*斜体*'
+    },
+    {
+      name: '5. 粗体 **text**',
+      check: (html) => html.includes('<strong>粗体</strong>'),
+      input: '**粗体**'
+    },
+    {
+      name: '6. 粗斜体 ***text***',
+      check: (html) => html.includes('<strong><em>粗斜体</em></strong>'),
+      input: '***粗斜体***'
+    },
+    {
+      name: '7. 删除线 ~~text~~',
+      check: (html) => html.includes('<del>删除</del>'),
+      input: '~~删除~~'
+    },
+    {
+      name: '8. 行内代码 <code>',
+      check: (html) => html.includes('<code class="md-code-inline">var x = 1;</code>'),
+      input: '`var x = 1;`'
+    },
+    {
+      name: '9. 行内代码优先级最高（内部星号不变斜体）',
+      check: (html) => html.includes('<code class="md-code-inline">*a*</code>') && !/<em>a<\/em>/.test(html),
+      input: '`*a*`'
+    },
+    {
+      name: '10. 普通链接',
+      check: (html) => html.includes('<a href="https://example.com"') && html.includes('>示例</a>'),
+      input: '[示例](https://example.com)'
+    },
+    {
+      name: '11. 图片渲染 <img> 与 alt',
+      check: (html) => html.includes('<img src="a.png" alt="图片说明">'),
+      input: '![图片说明](a.png)'
+    },
+    {
+      name: '12. javascript: 协议被过滤',
+      check: (html) => !/href="javascript:/i.test(html) && html.includes('md-unsafe-link'),
+      input: '[x](javascript:alert(1))'
+    },
+    {
+      name: '13. 无序列表三种标记',
+      check: (html) => {
+        return /<li>a\s*<\/li>/.test(html) && /<li>b\s*<\/li>/.test(html) && /<li>c\s*<\/li>/.test(html);
+      },
+      input: '- a\n* b\n+ c'
+    },
+    {
+      name: '14. 有序列表',
+      check: (html) => html.includes('<ol>') && /<li>一\s*<\/li>/.test(html) && /<li>二\s*<\/li>/.test(html),
+      input: '1. 一\n2. 二'
+    },
+    {
+      name: '15. 嵌套列表至少 3 层（2 空格缩进）',
+      check: (html) => maxNestingDepth(html, 'ul') >= 3,
+      input: '- a\n  - b\n    - c'
+    },
+    {
+      name: '16. 嵌套列表 4 空格缩进同样支持',
+      check: (html) => maxNestingDepth(html, 'ul') >= 3,
+      input: '- a\n    - b\n        - c'
+    },
+    {
+      name: '17. 有序嵌套有序',
+      check: (html) => maxNestingDepth(html, 'ol') >= 2,
+      input: '1. a\n2. b\n   1. c\n   2. d\n3. e'
+    },
+    {
+      name: '18. 列表项多段落内容',
+      check: (html) => {
+        const liSegment = html.slice(html.indexOf('<li>'), html.indexOf('</li>', html.indexOf('<li>') + 4) + 5);
+        return liSegment.includes('<p>第一段</p>') && liSegment.includes('<p>第二段</p>');
+      },
+      input: '- 第一段\n\n  第二段'
+    },
+    {
+      name: '19. 围栏代码块与语言标签',
+      check: (html) => html.includes('data-lang="js"') && html.includes('md-code-lang') && html.includes('const a = 1;'),
+      input: '```js\nconst a = 1;\n```'
+    },
+    {
+      name: '20. 代码块内 Markdown 不被解析（* # ` 原样）',
+      check: (html) => {
+        const pre = html.slice(html.indexOf('<pre>'), html.indexOf('</pre>'));
+        return pre.includes('*不是斜体*') && pre.includes('# 不是标题') &&
+          pre.includes('`backtick`') && !pre.includes('<em>') && !pre.includes('<h1');
+      },
+      input: '```\n*不是斜体*\n# 不是标题\n`backtick`\n```'
+    },
+    {
+      name: '21. 未闭合围栏不崩溃且原样输出',
+      check: (html) => html.includes('<pre>') && html.includes('未闭合'),
+      input: '```\n未闭合'
+    },
+    {
+      name: '22. 引用块',
+      check: (html) => html.includes('<blockquote>') && html.includes('引用内容'),
+      input: '> 引用内容'
+    },
+    {
+      name: '23. 嵌套引用 >>',
+      check: (html) => maxNestingDepth(html, 'blockquote') >= 2,
+      input: '> 外层\n>> 内层'
+    },
+    {
+      name: '24. 引用块内包含列表',
+      check: (html) => {
+        const segment = html.slice(html.indexOf('<blockquote>'));
+        return segment.includes('<ul>') && /<li>项\s*<\/li>/.test(segment);
+      },
+      input: '> - 项'
+    },
+    {
+      name: '25. 表格表头/行数与列数',
+      check: (html) => {
+        return html.includes('<table>') &&
+          (html.match(/<th[ >]/g) || []).length === 2 &&
+          (html.match(/<tr>/g) || []).length === 3 &&
+          countOccurrences(html, '<td>') === 4 &&
+          html.includes('<td>1</td>') && html.includes('<td>2</td>');
+      },
+      input: '| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |'
+    },
+    {
+      name: '26. 表格对齐属性 :--- / ---: / :---: ',
+      check: (html) => html.includes('text-align:left') &&
+        html.includes('text-align:right') && html.includes('text-align:center'),
+      input: '| L | R | C |\n| :--- | ---: | :---: |\n| 1 | 2 | 3 |'
+    },
+    {
+      name: '27. 水平线三种写法',
+      check: (html) => countOccurrences(html, '<hr>') === 3,
+      input: '---\n\n***\n\n___'
+    },
+    {
+      name: '28. 反斜杠转义按普通文本输出',
+      check: (html) => html.includes('*普通*') && !html.includes('<em>普通</em>') &&
+        html.includes('`code`') && html.includes('a|b'),
+      input: '\\*普通*  \\`code`  a\\|b'
+    },
+    {
+      name: '29. 非法/怪输入不抛异常',
+      check: (html) => typeof html === 'string' && html.includes('markdown-body'),
+      input: '###\n\n|\n\n[未闭合\n(无括号)\n\n***\n> \n- \n`单tick'
+    },
+    {
+      name: '30. parseInline 对空值安全',
+      check: () => {
+        let ok = true;
+        try { parseInline(undefined); parseInline(null); parseInline(''); } catch { ok = false; }
+        return ok;
+      },
+      input: ''
+    }
+  ];
+
+  const results = cases.map((testCase) => {
+    let passed = false;
+    let detail = '';
+    let html = '';
+    try {
+      html = render(testCase.input);
+      passed = !!testCase.check(html);
+      if (!passed) detail = '断言返回 false。实际 HTML 片段：' + html.slice(0, 300);
+    } catch (error) {
+      passed = false;
+      detail = '断言执行抛异常：' + (error && error.stack ? error.stack : String(error));
+    }
+    return { name: testCase.name, passed, detail, html };
+  });
+
+  return {
+    total: results.length,
+    passed: results.filter((r) => r.passed).length,
+    failed: results.filter((r) => !r.passed).length,
+    results
+  };
+}
+
+
+
+
+
+
+
+// ===== src/ui.js =====
+// src/ui.js
+// 界面逻辑：实时渲染（300ms 防抖）、耗时统计、示例加载、
+// 复制 HTML、清空、运行测试并逐条展示结果。
+
+
+// 三个内置示例
+const SAMPLES = {
+  full: {
+    label: '完整语法示例',
+    text: [
+      '# Markdown 渲染器演示',
+      '',
+      '## 强调语法',
+      '这是 *斜体*、**粗体**、***粗斜体***、~~删除线~~ 与 `行内代码`。',
+      '',
+      '## 链接与图片',
+      '这是一个[链接](https://example.com "标题")，图片：![占位图](https://example.com/a.png)。',
+      '危险链接会被拦截：[bad](javascript:alert(1))。',
+      '',
+      '## 列表',
+      '- 无序项一',
+      '- 无序项二',
+      '  1. 嵌套有序 A',
+      '  2. 嵌套有序 B',
+      '- 无序项三',
+      '',
+      '## 引用',
+      '> 外层引用',
+      '>',
+      '> > 内层引用，含 **粗体**',
+      '',
+      '## 代码块',
+      '```js',
+      'function add(a, b) {',
+      '  // # 这一行在代码块里，不会被解析成标题',
+      '  return a + b;',
+      '}',
+
+      '```',
+      '',
+      '## 表格',
+      '| 左对齐 | 居中 | 右对齐 |',
+      '| :--- | :---: | ---: |',
+      '| 1 | 2 | 3 |',
+      '| 4 | 5 | 6 |',
+      '',
+      '## 水平线',
+      '上面是普通文本。',
+      '',
+      '---',
+      '',
+      '下面是水平线之后的内容。',
+      '',
+      '## 换行',
+      '第一行（行尾两个空格）  ',
+      '第二行'
+    ].join('\n')
+  },
+  nested: {
+    label: '嵌套列表与引用示例',
+    text: [
+      '# 嵌套列表',
+      '',
+      '1. 第一层 1',
+      '   1. 第二层 1.1',
+      '      - 第三层 A',
+      '        - 第四层 A-1',
+      '      - 第三层 B',
+      '   2. 第二层 1.2',
+      '2. 第一层 2',
+      '',
+      '## 2 空格缩进',
+      '',
+      '- 水果',
+      '  - 苹果',
+      '    - 红富士',
+      '  - 香蕉',
+      '- 蔬菜',
+      '',
+      '## 列表项中的多段落',
+      '',
+      '- 这是列表项的第一段。',
+      '',
+      '  这是同一项的第二段，说明列表项可以包含多段落内容。',
+      '',
+      '  - 列表项中还可以嵌套列表',
+      '',
+      '# 嵌套引用',
+      '',
+      '> 一级引用',
+      '> > 二级引用',
+      '> > > 三级引用，包含 `代码` 与 *斜体*',
+      '>',
+      '> 回到一级，下面是引用中的列表：',
+      '>',
+      '> - 第一项',
+      '> - 第二项',
+      '>   1. 嵌套有序',
+      '>   2. 再来一项'
+    ].join('\n')
+  },
+  escape: {
+    label: '转义与代码块示例',
+    text: [
+      '# 转义与代码块',
+      '',
+      '## 反斜杠转义',
+      '',
+      '\\* 这不是斜体 \\*',
+      '\\` 这不是行内代码 \\`',
+      '\\# 这不是标题',
+      'a\\*b\\_c\\[d\\]\\(e\\)',
+      '',
+      '## 行内代码的最高优先级',
+      '',
+      '`*不是斜体*`、`**不是粗体**`、`[不是链接](x)`',
+      '',
+      '## 代码块原样输出',
+      '',
+      '```',
+      '# 井号原样',
+      '*星号原样*',
+      '`反引号原样`',
+      '[链接语法原样](url)',
+      '   缩进也保留',
+      '```',
+      '',
+      '```python',
+      '# Python 示例（语言仅做标签展示）',
+      'def hello():',
+      '    print("*hi* #")',
+      '```',
+      '',
+      '## 边界输入',
+      '',
+      '未闭合的代码围栏也不会崩溃，未闭合的 *强调 按文本输出。',
+      '',
+      '```',
+      '未闭合围栏内容'
+    ].join('\n')
+  }
+};
+
+const DEBOUNCE_MS = 300;
+
+function debounce(fn, wait) {
+  let timer = null;
+  return function debounced(...args) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), wait);
+  };
+}
+
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  // file:// 等环境下 clipboard API 可能不可用：使用 textarea + execCommand 兜底
+  return new Promise((resolve, reject) => {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      resolve();
+    } catch (error) {
+      reject(error);
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  });
+}
+
+function initUI() {
+  const editor = document.getElementById('editor');
+  const preview = document.getElementById('preview');
+  const timing = document.getElementById('timing');
+  const sampleSelect = document.getElementById('sampleSelect');
+  const loadSampleBtn = document.getElementById('loadSampleBtn');
+  const copyHtmlBtn = document.getElementById('copyHtmlBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const runTestsBtn = document.getElementById('runTestsBtn');
+  const testPanel = document.getElementById('testPanel');
+  const testSummary = document.getElementById('testSummary');
+  const testList = document.getElementById('testList');
+
+  // 填充示例下拉框
+  Object.entries(SAMPLES).forEach(([key, sample]) => {
+    const option = document.createElement('option');
+    option.value = key;
+    option.textContent = sample.label;
+    sampleSelect.appendChild(option);
+  });
+
+  function renderNow() {
+    const source = editor.value;
+    const start = performance.now();
+    let html;
+    try {
+      const ast = parseBlocks(source);
+      html = renderDocument(ast);
+    } catch (error) {
+      html = '<div class="md-render-error">解析异常：' +
+        String(error && error.message ? error.message : error) + '</div>';
+    }
+    const cost = performance.now() - start;
+    preview.innerHTML = html;
+    timing.textContent = '解析耗时：' + cost.toFixed(2) + ' ms';
+  }
+
+  const scheduleRender = debounce(renderNow, DEBOUNCE_MS);
+
+  editor.addEventListener('input', scheduleRender);
+
+  loadSampleBtn.addEventListener('click', () => {
+    const key = sampleSelect.value;
+    const sample = SAMPLES[key];
+    if (!sample) return;
+    editor.value = sample.text;
+    renderNow();
+  });
+
+  copyHtmlBtn.addEventListener('click', async () => {
+    const oldText = copyHtmlBtn.textContent;
+    try {
+      await copyText(preview.innerHTML);
+      copyHtmlBtn.textContent = '已复制 ✓';
+    } catch {
+      copyHtmlBtn.textContent = '复制失败';
+    }
+    setTimeout(() => { copyHtmlBtn.textContent = oldText; }, 1500);
+  });
+
+  clearBtn.addEventListener('click', () => {
+    editor.value = '';
+    renderNow();
+    editor.focus();
+  });
+
+  runTestsBtn.addEventListener('click', () => {
+    const report = runTests();
+    testPanel.hidden = false;
+    testSummary.innerHTML =
+      '共 <strong>' + report.total + '</strong> 条，' +
+      '通过 <strong class="test-pass-count">' + report.passed + '</strong> 条，' +
+      '失败 <strong class="test-fail-count">' + report.failed + '</strong> 条';
+    testSummary.className = report.failed === 0 ? 'test-summary pass' : 'test-summary fail';
+
+    testList.innerHTML = '';
+    report.results.forEach((result) => {
+      const item = document.createElement('details');
+      item.className = 'test-case ' + (result.passed ? 'pass' : 'fail');
+      const summary = document.createElement('summary');
+      summary.textContent = (result.passed ? '✓ ' : '✗ ') + result.name;
+      item.appendChild(summary);
+      if (!result.passed) {
+        const detail = document.createElement('pre');
+        detail.className = 'test-detail';
+        detail.textContent = result.detail;
+        item.appendChild(detail);
+      }
+      testList.appendChild(item);
+    });
+  });
+
+  // 默认加载完整示例并首次渲染
+  editor.value = SAMPLES.full.text;
+  renderNow();
+}
+
+
+// ===== src/main.js =====
+// src/main.js
+// 应用入口：等待 DOM 就绪后启动 UI。
+
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initUI);
+} else {
+  initUI();
+}
+
+</script>
+</body>
+</html>
